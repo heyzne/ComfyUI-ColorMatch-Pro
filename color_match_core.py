@@ -6,9 +6,126 @@ from sklearn.cluster import KMeans
 from scipy import linalg
 import warnings
 
+try:
+    from skimage.color import rgb2lab, lab2rgb
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+    warnings.warn("scikit-image not installed, falling back to cv2 for LAB conversion. Install with: pip install scikit-image")
+
+# ============================================================
+# 融合自 mini-nodes 的核心算法
+# ============================================================
+
+def apply_mkl(t_img, t_pixels, r_pixels):
+    """MKL 颜色迁移（来自 mini-nodes）"""
+    mu_t = np.mean(t_pixels, axis=0)
+    mu_r = np.mean(r_pixels, axis=0)
+
+    t_centered = t_pixels - mu_t
+    r_centered = r_pixels - mu_r
+
+    cov_t = np.cov(t_centered, rowvar=False) + np.eye(3) * 1e-6
+    cov_r = np.cov(r_centered, rowvar=False) + np.eye(3) * 1e-6
+
+    try:
+        evals_t, evecs_t = np.linalg.eigh(cov_t)
+        inv_sqrt_t = evecs_t @ np.diag(1.0 / np.sqrt(np.maximum(evals_t, 1e-6))) @ evecs_t.T
+
+        evals_r, evecs_r = np.linalg.eigh(cov_r)
+        sqrt_r = evecs_r @ np.diag(np.sqrt(np.maximum(evals_r, 0))) @ evecs_r.T
+
+        t = sqrt_r @ inv_sqrt_t
+        out = (t_img - mu_t) @ t.T + mu_r
+    except:
+        out = (t_img - mu_t) * (np.std(r_pixels, axis=0) / (np.std(t_pixels, axis=0) + 1e-6)) + mu_r
+
+    return np.clip(out, 0, 1)
+
+def apply_wavelet_easy(t_img, r_img):
+    """Wavelet 简易校色（来自 mini-nodes）"""
+    t_low = cv2.GaussianBlur(t_img, (0, 0), 15)
+    r_low = cv2.GaussianBlur(r_img, (0, 0), 15)
+    out = t_img + (r_low - t_low)
+    return np.clip(out, 0, 1)
+
+def apply_linear(t_pixels, r_pixels, img):
+    """Linear 独立缩放（来自 mini-nodes）"""
+    t_mean, t_std = np.mean(t_pixels, axis=0), np.std(t_pixels, axis=0)
+    r_mean, r_std = np.mean(r_pixels, axis=0), np.std(r_pixels, axis=0)
+    scale = r_std / (t_std + 1e-5)
+    corrected = (img - t_mean) * scale + r_mean
+    return np.clip(corrected, 0, 1)
+
+def apply_mean(t_pixels, r_pixels, img):
+    """Mean 仅平移（来自 mini-nodes）"""
+    t_mean = np.mean(t_pixels, axis=0)
+    r_mean = np.mean(r_pixels, axis=0)
+    corrected = img + (r_mean - t_mean)
+    return np.clip(corrected, 0, 1)
+
+# ============================================================
+# 安全的 LAB 转换辅助函数
+# ============================================================
+
+def safe_rgb2lab(rgb_img):
+    """安全的 RGB -> LAB 转换，使用 skimage 优先"""
+    rgb_img = np.clip(rgb_img, 0, 1)
+    if HAS_SKIMAGE:
+        return rgb2lab(rgb_img).astype(np.float32)
+    else:
+        # cv2 回退：cv2 期望 BGR 输入
+        bgr = (rgb_img[..., ::-1] * 255).astype(np.uint8)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        # cv2 LAB 范围: L=0-255, A=0-255, B=0-255
+        # 转换到 skimage 范围: L=0-100, A=-128~127, B=-128~127
+        lab[:,:,0] = lab[:,:,0] * (100.0 / 255.0)
+        lab[:,:,1] = lab[:,:,1] - 128.0
+        lab[:,:,2] = lab[:,:,2] - 128.0
+        return lab
+
+def safe_lab2rgb(lab_img):
+    """安全的 LAB -> RGB 转换，使用 skimage 优先"""
+    if HAS_SKIMAGE:
+        rgb = lab2rgb(lab_img)
+        return np.clip(rgb, 0, 1).astype(np.float32)
+    else:
+        # cv2 回退
+        lab = lab_img.copy()
+        lab[:,:,0] = np.clip(lab[:,:,0] * (255.0 / 100.0), 0, 255)
+        lab[:,:,1] = np.clip(lab[:,:,1] + 128.0, 0, 255)
+        lab[:,:,2] = np.clip(lab[:,:,2] + 128.0, 0, 255)
+        bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+        rgb = bgr[..., ::-1].astype(np.float32) / 255.0
+        return np.clip(rgb, 0, 1)
+
+def safe_pixels_rgb2lab(pixels):
+    """将像素数组 (N,3) 安全转换为 LAB (N,3)"""
+    pixels = np.atleast_2d(pixels)
+    if pixels.shape[-1] != 3:
+        pixels = pixels.reshape(-1, 3)
+    pixels = np.clip(pixels, 0, 1)
+
+    if HAS_SKIMAGE:
+        # skimage rgb2lab 需要 (H,W,3) 形状
+        n = pixels.shape[0]
+        # reshape 为 (1, n, 3) 作为单行图像
+        lab = rgb2lab(pixels.reshape(1, -1, 3)).reshape(-1, 3).astype(np.float32)
+        return lab
+    else:
+        bgr = (pixels[..., ::-1] * 255).astype(np.uint8)
+        lab = cv2.cvtColor(bgr.reshape(1, -1, 3), cv2.COLOR_BGR2LAB).astype(np.float32).reshape(-1, 3)
+        lab[:,0] = lab[:,0] * (100.0 / 255.0)
+        lab[:,1] = lab[:,1] - 128.0
+        lab[:,2] = lab[:,2] - 128.0
+        return lab
+
+# ============================================================
+# ColorMatchEngine - 高级颜色匹配引擎
+# ============================================================
 
 class ColorMatchEngine:
-    """高级颜色匹配引擎"""
+    """高级颜色匹配引擎 - 融合 mini-nodes 算法"""
 
     def __init__(self, method="mean_shift", strength=1.0):
         self.method = method
@@ -45,8 +162,8 @@ class ColorMatchEngine:
             arr = np.array(tensor).astype(np.float32) / 255.0
         else:
             arr = tensor.astype(np.float32)
-            if arr.max() > 1.0:
-                arr /= 255.0
+        if arr.max() > 1.0:
+            arr /= 255.0
 
         if arr.ndim == 3 and arr.shape[2] == 4:
             arr = arr[:, :, :3]
@@ -86,6 +203,8 @@ class ColorMatchEngine:
             return self._mkl_transfer(source, target, mask, preserve_luminance)
         elif self.method == "idt":
             return self._idt_transfer(source, target, mask, preserve_luminance)
+        elif self.method == "adaptive":
+            return self._adaptive_match(source, target, mask, preserve_luminance)
         else:
             return self._adaptive_match(source, target, mask, preserve_luminance)
 
@@ -99,9 +218,9 @@ class ColorMatchEngine:
                     s_mean = source[:,:,c][mask_bool].mean()
                     t_mean = target[:,:,c][mask_bool].mean()
                     shift = (t_mean - s_mean) * self.strength
-                    result[:,:,c] = np.where(mask_bool, 
-                                             np.clip(source[:,:,c] + shift, 0, 1),
-                                             source[:,:,c])
+                    result[:,:,c] = np.where(mask_bool,
+                        np.clip(source[:,:,c] + shift, 0, 1),
+                        source[:,:,c])
             else:
                 for c in range(3):
                     shift = (target[:,:,c].mean() - source[:,:,c].mean()) * self.strength
@@ -207,8 +326,8 @@ class ColorMatchEngine:
         return result
 
     def _lab_transfer(self, source, target, mask, preserve_luminance):
-        source_lab = cv2.cvtColor((source*255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-        target_lab = cv2.cvtColor((target*255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        source_lab = safe_rgb2lab(source)
+        target_lab = safe_rgb2lab(target)
 
         for i in range(3):
             if mask is not None and mask.max() > 0.01:
@@ -229,7 +348,7 @@ class ColorMatchEngine:
             if std_s > 1e-5:
                 source_lab[:,:,i] = (source_lab[:,:,i] - mean_s) * (std_t / std_s) + mean_t
 
-        result = cv2.cvtColor(np.clip(source_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32) / 255
+        result = safe_lab2rgb(source_lab)
 
         if mask is not None and mask.max() > 0.01:
             mask_bool = mask > 0.5
@@ -369,6 +488,10 @@ class ColorMatchEngine:
         return result
 
 
+# ============================================================
+# SubjectDetector - 自动主体检测器
+# ============================================================
+
 class SubjectDetector:
     """自动主体检测器"""
 
@@ -491,33 +614,39 @@ class SubjectDetector:
         return mask
 
 
+# ============================================================
+# ColorClone - 高级颜色克隆器（核心改进版）
+# ============================================================
+
 class ColorClone:
     """
-    高级颜色克隆器
+    高级颜色克隆器 - 融合 mini-nodes 算法 + 智能自适应
 
-    新增 color_adapter 模式：
-    模仿 LayerColor ColorAdapter 思路，
-    在LAB空间做AB通道（色彩）偏移，保留L（亮度），
-    同时排除参考图中的白色背景干扰。
+    核心改进：
+    1. 颜色差异自适应：颜色接近时几乎不改，差异大时才全力调色
+    2. 增加 mini-nodes 的 4 种调色算法
+    3. 产品专用模式：自动排除白色背景干扰
+    4. 亮度保护：可选保留原图光影
+    5. 使用 skimage 替代 cv2 进行 LAB 转换，避免通道顺序问题
     """
 
     def __init__(self):
         self.engine = ColorMatchEngine()
 
-    def clone(self, source, reference, mode="product", mask=None, 
+    def clone(self, source, reference, mode="color_adapter", mask=None,
               preserve_structure=True, color_strength=1.0, ref_mask=None):
         source_np = self._to_numpy(source)
         ref_np = self._to_numpy(reference)
 
         if source_np.shape[:2] != ref_np.shape[:2]:
-            ref_np = cv2.resize(ref_np, (source_np.shape[1], source_np.shape[0]), 
+            ref_np = cv2.resize(ref_np, (source_np.shape[1], source_np.shape[0]),
                                 interpolation=cv2.INTER_LANCZOS4)
 
         mask_np = None
         if mask is not None:
             mask_np = self._to_numpy_mask(mask)
             if mask_np.shape[:2] != source_np.shape[:2]:
-                mask_np = cv2.resize(mask_np, (source_np.shape[1], source_np.shape[0]), 
+                mask_np = cv2.resize(mask_np, (source_np.shape[1], source_np.shape[0]),
                                      interpolation=cv2.INTER_LINEAR)
             mask_np = np.clip(mask_np, 0, 1)
 
@@ -525,8 +654,8 @@ class ColorClone:
         if ref_mask is not None:
             ref_mask = self._to_numpy_mask(ref_mask)
             if ref_mask.shape[:2] != ref_np.shape[:2]:
-                ref_mask = cv2.resize(ref_mask, (ref_np.shape[1], ref_np.shape[0]), 
-                                         interpolation=cv2.INTER_LINEAR)
+                ref_mask = cv2.resize(ref_mask, (ref_np.shape[1], ref_np.shape[0]),
+                                      interpolation=cv2.INTER_LINEAR)
             ref_mask = np.clip(ref_mask, 0, 1)
 
         if mode == "product":
@@ -547,6 +676,15 @@ class ColorClone:
             return self._clone_rgb_match(source_np, ref_np, mask_np, color_strength, ref_mask)
         elif mode == "smart":
             return self._clone_smart(source_np, ref_np, mask_np, color_strength, ref_mask)
+        # === 新增 mini-nodes 融合模式 ===
+        elif mode == "mini_linear":
+            return self._clone_mini_linear(source_np, ref_np, mask_np, color_strength, ref_mask)
+        elif mode == "mini_mean":
+            return self._clone_mini_mean(source_np, ref_np, mask_np, color_strength, ref_mask)
+        elif mode == "mini_mkl":
+            return self._clone_mini_mkl(source_np, ref_np, mask_np, color_strength, ref_mask)
+        elif mode == "mini_wavelet":
+            return self._clone_mini_wavelet(source_np, ref_np, mask_np, color_strength, ref_mask)
 
         return source_np
 
@@ -583,11 +721,17 @@ class ColorClone:
 
     def _extract_product_color(self, image, mask=None, white_thresh=0.88):
         """智能提取产品颜色，排除白色/近白背景"""
+        h, w = image.shape[:2]
         pixels = image.reshape(-1, 3)
 
         if mask is not None and mask.max() > 0.01:
+            # 确保 mask 尺寸匹配
+            if mask.shape[:2] != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
             mask_flat = mask.flatten() > 0.5
-            pixels = pixels[mask_flat]
+            # 安全检查：确保长度匹配
+            if len(mask_flat) == pixels.shape[0]:
+                pixels = pixels[mask_flat]
 
         # 排除白色/近白像素
         luminance = 0.299*pixels[:,0] + 0.587*pixels[:,1] + 0.114*pixels[:,2]
@@ -604,122 +748,151 @@ class ColorClone:
 
         return product_pixels
 
+    def _calc_color_diff(self, source_pixels, ref_pixels):
+        """计算 LAB 空间颜色差异，返回差异度和自适应强度"""
+        if len(source_pixels) < 10 or len(ref_pixels) < 10:
+            return 999, 1.0  # 数据不足，全力调色
+
+        source_pixels = np.atleast_2d(source_pixels)
+        ref_pixels = np.atleast_2d(ref_pixels)
+        if source_pixels.shape[-1] != 3:
+            source_pixels = source_pixels.reshape(-1, 3)
+        if ref_pixels.shape[-1] != 3:
+            ref_pixels = ref_pixels.reshape(-1, 3)
+
+        # 使用安全的 LAB 转换
+        src_lab = safe_pixels_rgb2lab(source_pixels)
+        ref_lab = safe_pixels_rgb2lab(ref_pixels)
+
+        src_ab_mean = np.array([src_lab[:,1].mean(), src_lab[:,2].mean()])
+        ref_ab_mean = np.array([ref_lab[:,1].mean(), ref_lab[:,2].mean()])
+
+        ab_diff = np.linalg.norm(ref_ab_mean - src_ab_mean)
+
+        # 根据差异计算自适应强度
+        if ab_diff < 3:
+            adaptive_strength = 0.05
+        elif ab_diff < 8:
+            adaptive_strength = 0.3
+        elif ab_diff < 15:
+            adaptive_strength = 0.7
+        else:
+            adaptive_strength = 1.0
+
+        return ab_diff, adaptive_strength
+
     def _clone_color_adapter(self, source, reference, mask, strength, ref_mask=None):
         """
-        ColorAdapter风格克隆 - 改进版
-
-        核心改进：不用AB均值偏移，而是做AB通道直方图匹配
-        这样即使参考图和原图颜色接近，也能精确对齐颜色分布
-        避免均值偏移导致的过度校正和发灰问题
-
-        步骤：
-        1. 转到LAB空间
-        2. 提取参考图产品区域（排除白色背景）
-        3. 对AB通道做蒙版区域内的直方图匹配
-        4. L通道完全不动
-        5. 可选：如果颜色差异很小，减少匹配强度
+        ColorAdapter风格克隆 - 稳定版
+        使用 skimage 替代 cv2 进行 LAB 转换，避免通道顺序问题
         """
         # 处理 ref_mask
         ref_mask_np = None
         if ref_mask is not None:
             ref_mask_np = self._to_numpy_mask(ref_mask)
             if ref_mask_np.shape[:2] != reference.shape[:2]:
-                ref_mask_np = cv2.resize(ref_mask_np, (reference.shape[1], reference.shape[0]), 
+                ref_mask_np = cv2.resize(ref_mask_np, (reference.shape[1], reference.shape[0]),
                                          interpolation=cv2.INTER_LINEAR)
             ref_mask_np = np.clip(ref_mask_np, 0, 1)
 
-        # 转到LAB空间
-        source_lab = cv2.cvtColor((source * 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-        ref_lab = cv2.cvtColor((reference * 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        # 提取参考图产品区域颜色（排除白色背景）
+        ref_product = self._extract_product_color(reference, ref_mask_np, white_thresh=0.88)
+        if len(ref_product) < 10:
+            return np.clip(source, 0, 1)
 
+        # 使用安全的 LAB 转换
+        source_lab = safe_rgb2lab(source)
         result_lab = source_lab.copy()
 
         if mask is not None and mask.max() > 0.01:
             mask_bool = mask > 0.5
-
             if mask_bool.sum() > 10:
-                # 提取参考图产品区域（排除白色背景）
-                ref_product = self._extract_product_color(reference, ref_mask_np, white_thresh=0.88)
-
-                # 将参考图产品像素转到LAB
-                ref_product_uint8 = (ref_product * 255).astype(np.uint8).reshape(1, -1, 3)
-                ref_product_lab = cv2.cvtColor(ref_product_uint8, cv2.COLOR_RGB2LAB).astype(np.float32).reshape(-1, 3)
-
-                # 提取原图蒙版区域像素
                 src_product = source[mask_bool]
-                src_product_uint8 = (src_product * 255).astype(np.uint8).reshape(1, -1, 3)
-                src_product_lab = cv2.cvtColor(src_product_uint8, cv2.COLOR_RGB2LAB).astype(np.float32).reshape(-1, 3)
+                if len(src_product) > 0:
+                    # 计算颜色差异和自适应强度
+                    ab_diff, adaptive_strength = self._calc_color_diff(src_product, ref_product)
 
-                # 对A和B通道分别做直方图匹配（不是均值偏移！）
-                for i in [1, 2]:  # A通道和B通道
-                    s_vals = src_product_lab[:,i]
-                    r_vals = ref_product_lab[:,i]
+                    if adaptive_strength < 0.01:
+                        return np.clip(source, 0, 1)
 
-                    if len(s_vals) < 10 or len(r_vals) < 10:
-                        continue
+                    effective_strength = strength * adaptive_strength
+                    if effective_strength < 0.01:
+                        return np.clip(source, 0, 1)
 
-                    # 直方图匹配
-                    s_counts, _ = np.histogram(s_vals, bins=256, range=(0, 255))
-                    r_counts, _ = np.histogram(r_vals, bins=256, range=(0, 255))
+                    # 将像素转到LAB
+                    src_product_lab = safe_pixels_rgb2lab(src_product)
+                    ref_product_lab = safe_pixels_rgb2lab(ref_product)
 
-                    s_cdf = np.cumsum(s_counts).astype(np.float64)
-                    r_cdf = np.cumsum(r_counts).astype(np.float64)
-                    s_cdf = s_cdf / (s_cdf[-1] + 1e-10)
-                    r_cdf = r_cdf / (r_cdf[-1] + 1e-10)
-
-                    lut = np.interp(s_cdf, r_cdf, np.linspace(0, 255, 256))
-
-                    # 应用查找表到整个图像的该通道
-                    idx = source_lab[:,:,i].astype(np.uint8)
-                    matched = lut[idx].reshape(source.shape[:2])
-
-                    # 只替换蒙版区域，平滑混合
-                    result_lab[:,:,i] = np.where(mask_bool, 
-                                                 source_lab[:,:,i] * (1 - strength) + matched * strength,
-                                                 source_lab[:,:,i])
-
-                # L通道完全不动，保留原图所有光影
-                # 但检测颜色差异，如果差异很小，进一步降低AB匹配强度
-                ref_ab_mean = np.array([ref_product_lab[:,1].mean(), ref_product_lab[:,2].mean()])
-                src_ab_mean = np.array([src_product_lab[:,1].mean(), src_product_lab[:,2].mean()])
-                ab_diff = np.linalg.norm(ref_ab_mean - src_ab_mean)
-
-                # 如果AB差异很小（<5），说明颜色已经很接近，降低strength避免过度校正
-                if ab_diff < 5:
-                    # 颜色已经很接近，只做轻微校正
+                    # 对A和B通道分别做直方图匹配（skimage LAB 范围：A/B = -128~127）
                     for i in [1, 2]:
-                        shift = (ref_product_lab[:,i].mean() - src_product_lab[:,i].mean()) * strength * 0.3
+                        if len(src_product_lab) < 10 or len(ref_product_lab) < 10:
+                            continue
+
+                        s_vals = src_product_lab[:,i]
+                        r_vals = ref_product_lab[:,i]
+
+                        # 直方图匹配
+                        s_counts, _ = np.histogram(s_vals, bins=256, range=(-128, 127))
+                        r_counts, _ = np.histogram(r_vals, bins=256, range=(-128, 127))
+
+                        s_cdf = np.cumsum(s_counts).astype(np.float64)
+                        r_cdf = np.cumsum(r_counts).astype(np.float64)
+                        s_cdf = s_cdf / (s_cdf[-1] + 1e-10)
+                        r_cdf = r_cdf / (r_cdf[-1] + 1e-10)
+
+                        lut = np.interp(s_cdf, r_cdf, np.linspace(-128, 127, 256))
+
+                        # 应用查找表到整个图像的该通道（增加 clip 保护）
+                        idx_float = source_lab[:,:,i]
+                        # 将 -128~127 映射到 0~255 用于 LUT 索引
+                        idx = np.clip(((idx_float + 128) / 255 * 255).astype(np.int32), 0, 255)
+                        matched = lut[idx].reshape(source.shape[:2])
+
+                        # 只替换蒙版区域，平滑混合
                         result_lab[:,:,i] = np.where(mask_bool,
-                                                     np.clip(source_lab[:,:,i] + shift, 0, 255),
-                                                     source_lab[:,:,i])
+                            source_lab[:,:,i] * (1 - effective_strength) + matched * effective_strength,
+                            source_lab[:,:,i])
+            else:
+                return np.clip(source, 0, 1)
         else:
             # 无蒙版，全图处理
-            ref_product = self._extract_product_color(reference, ref_mask_np, white_thresh=0.88)
-            ref_product_uint8 = (ref_product * 255).astype(np.uint8).reshape(1, -1, 3)
-            ref_product_lab = cv2.cvtColor(ref_product_uint8, cv2.COLOR_RGB2LAB).astype(np.float32).reshape(-1, 3)
+            src_product = source.reshape(-1, 3)
+            ab_diff, adaptive_strength = self._calc_color_diff(src_product, ref_product)
+
+            if adaptive_strength < 0.01:
+                return np.clip(source, 0, 1)
+
+            effective_strength = strength * adaptive_strength
+            if effective_strength < 0.01:
+                return np.clip(source, 0, 1)
+
+            ref_product_lab = safe_pixels_rgb2lab(ref_product)
 
             for i in [1, 2]:
+                if len(ref_product_lab) < 10:
+                    continue
                 r_vals = ref_product_lab[:,i]
                 s_vals = source_lab[:,:,i].flatten()
 
-                s_counts, _ = np.histogram(s_vals, bins=256, range=(0, 255))
-                r_counts, _ = np.histogram(r_vals, bins=256, range=(0, 255))
+                s_counts, _ = np.histogram(s_vals, bins=256, range=(-128, 127))
+                r_counts, _ = np.histogram(r_vals, bins=256, range=(-128, 127))
 
                 s_cdf = np.cumsum(s_counts).astype(np.float64)
                 r_cdf = np.cumsum(r_counts).astype(np.float64)
                 s_cdf = s_cdf / (s_cdf[-1] + 1e-10)
                 r_cdf = r_cdf / (r_cdf[-1] + 1e-10)
 
-                lut = np.interp(s_cdf, r_cdf, np.linspace(0, 255, 256))
+                lut = np.interp(s_cdf, r_cdf, np.linspace(-128, 127, 256))
 
-                idx = source_lab[:,:,i].astype(np.uint8)
+                idx = np.clip(((source_lab[:,:,i] + 128) / 255 * 255).astype(np.int32), 0, 255)
                 matched = lut[idx].reshape(source.shape[:2])
 
-                result_lab[:,:,i] = source_lab[:,:,i] * (1 - strength) + matched * strength
+                result_lab[:,:,i] = source_lab[:,:,i] * (1 - effective_strength) + matched * effective_strength
 
-        # 转回RGB
-        result = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32) / 255.0
-
+        # 使用安全的 LAB -> RGB 转换
+        result = safe_lab2rgb(result_lab)
+        # 最终安全检查
+        result = np.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
         return np.clip(result, 0, 1)
 
     def _clone_product(self, source, reference, mask, strength, ref_mask=None):
@@ -759,7 +932,6 @@ class ColorClone:
             return np.clip(result, 0, 1)
 
         mask_bool = mask > 0.5
-
         if mask_bool.sum() < 10:
             return source
 
@@ -785,9 +957,9 @@ class ColorClone:
             idx = (source[:,:,c].flatten() * 255).astype(np.uint8)
             matched = lut[idx].reshape(source.shape[:2])
 
-            result[:,:,c] = np.where(mask_bool, 
-                                     source[:,:,c] * (1 - strength) + matched * strength,
-                                     source[:,:,c])
+            result[:,:,c] = np.where(mask_bool,
+                source[:,:,c] * (1 - strength) + matched * strength,
+                source[:,:,c])
 
         source_lum = 0.299*source[:,:,0] + 0.587*source[:,:,1] + 0.114*source[:,:,2]
         result_lum = 0.299*result[:,:,0] + 0.587*result[:,:,1] + 0.114*result[:,:,2]
@@ -844,7 +1016,6 @@ class ColorClone:
                 continue
 
             pixel = src_flat[i]
-
             distances = np.linalg.norm(src_palette - pixel, axis=1)
             src_idx = distances.argmin()
 
@@ -852,9 +1023,7 @@ class ColorClone:
             target_color = ref_palette[ref_idx]
 
             shift = (target_color - src_palette[src_idx]) * strength
-
             weight = np.exp(-distances[src_idx] * 2)
-
             new_color = pixel + shift * weight
             result_flat[i] = np.clip(new_color, 0, 1)
 
@@ -944,16 +1113,16 @@ class ColorClone:
                         shifted = np.clip(shifted, 0, 255)
 
                     result_hsv[:,:,i] = np.where(mask_bool, shifted, result_hsv[:,:,i])
-        else:
-            for i in [0, 1]:
-                s_mean = source_hsv[:,:,i].mean()
-                r_mean = ref_hsv[:,:,i].mean()
-                shift = (r_mean - s_mean) * strength
+            else:
+                for i in [0, 1]:
+                    s_mean = source_hsv[:,:,i].mean()
+                    r_mean = ref_hsv[:,:,i].mean()
+                    shift = (r_mean - s_mean) * strength
 
-                if i == 0:
-                    result_hsv[:,:,i] = np.mod(result_hsv[:,:,i] + shift, 180)
-                else:
-                    result_hsv[:,:,i] = np.clip(result_hsv[:,:,i] + shift, 0, 255)
+                    if i == 0:
+                        result_hsv[:,:,i] = np.mod(result_hsv[:,:,i] + shift, 180)
+                    else:
+                        result_hsv[:,:,i] = np.clip(result_hsv[:,:,i] + shift, 0, 255)
 
         result = cv2.cvtColor(result_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32) / 255.0
         return np.clip(result, 0, 1)
@@ -982,8 +1151,8 @@ class ColorClone:
         return np.clip(source * (1 - strength) + result * strength, 0, 1)
 
     def _clone_mood(self, source, reference, mask, strength, ref_mask=None):
-        source_lab = cv2.cvtColor((source*255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-        ref_lab = cv2.cvtColor((reference*255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        source_lab = safe_rgb2lab(source)
+        ref_lab = safe_rgb2lab(reference)
 
         mean_s, std_s = source_lab[:,:,0].mean(), source_lab[:,:,0].std()
         mean_r, std_r = ref_lab[:,:,0].mean(), ref_lab[:,:,0].std()
@@ -996,7 +1165,7 @@ class ColorClone:
             if std_s > 1e-5:
                 source_lab[:,:,i] = (source_lab[:,:,i] - mean_s) * (std_r / std_s) * 0.3 + mean_r * 0.3 + source_lab[:,:,i] * 0.7
 
-        result = cv2.cvtColor(np.clip(source_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32) / 255
+        result = safe_lab2rgb(source_lab)
 
         if mask is not None and mask.max() > 0.01:
             mask_bool = mask > 0.5
@@ -1035,3 +1204,147 @@ class ColorClone:
                 result[:,:,c] = np.where(mask_bool, result[:,:,c], source[:,:,c])
 
         return np.clip(source * (1 - strength) + result * strength, 0, 1)
+
+    # ============================================================
+    # 新增：融合 mini-nodes 的调色算法（带颜色差异自适应）
+    # ============================================================
+
+    def _clone_mini_linear(self, source, reference, mask, strength, ref_mask=None):
+        """mini-nodes Linear 模式 + 颜色差异自适应"""
+        ref_product = self._extract_product_color(reference, ref_mask, white_thresh=0.88)
+
+        if mask is not None and mask.max() > 0.01:
+            mask_bool = mask > 0.5
+            if mask_bool.sum() < 10:
+                return source
+            src_product = source[mask_bool]
+        else:
+            src_product = source.reshape(-1, 3)
+            mask_bool = None
+
+        if len(src_product) < 10 or len(ref_product) < 10:
+            return source
+
+        # 颜色差异检测
+        ab_diff, adaptive_strength = self._calc_color_diff(src_product, ref_product)
+        if adaptive_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        effective_strength = strength * adaptive_strength
+        if effective_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        # Linear 算法
+        corrected = apply_linear(src_product, ref_product, source)
+        final = source + (corrected - source) * effective_strength
+
+        if mask_bool is not None:
+            for c in range(3):
+                final[:,:,c] = np.where(mask_bool, final[:,:,c], source[:,:,c])
+
+        return np.clip(final, 0, 1)
+
+    def _clone_mini_mean(self, source, reference, mask, strength, ref_mask=None):
+        """mini-nodes Mean 模式 + 颜色差异自适应"""
+        ref_product = self._extract_product_color(reference, ref_mask, white_thresh=0.88)
+
+        if mask is not None and mask.max() > 0.01:
+            mask_bool = mask > 0.5
+            if mask_bool.sum() < 10:
+                return source
+            src_product = source[mask_bool]
+        else:
+            src_product = source.reshape(-1, 3)
+            mask_bool = None
+
+        if len(src_product) < 10 or len(ref_product) < 10:
+            return source
+
+        ab_diff, adaptive_strength = self._calc_color_diff(src_product, ref_product)
+        if adaptive_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        effective_strength = strength * adaptive_strength
+        if effective_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        corrected = apply_mean(src_product, ref_product, source)
+        final = source + (corrected - source) * effective_strength
+
+        if mask_bool is not None:
+            for c in range(3):
+                final[:,:,c] = np.where(mask_bool, final[:,:,c], source[:,:,c])
+
+        return np.clip(final, 0, 1)
+
+    def _clone_mini_mkl(self, source, reference, mask, strength, ref_mask=None):
+        """mini-nodes MKL 模式 + 颜色差异自适应"""
+        ref_product = self._extract_product_color(reference, ref_mask, white_thresh=0.88)
+
+        if mask is not None and mask.max() > 0.01:
+            mask_bool = mask > 0.5
+            if mask_bool.sum() < 10:
+                return source
+            src_product = source[mask_bool]
+        else:
+            src_product = source.reshape(-1, 3)
+            mask_bool = None
+
+        if len(src_product) < 10 or len(ref_product) < 10:
+            return source
+
+        ab_diff, adaptive_strength = self._calc_color_diff(src_product, ref_product)
+        if adaptive_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        effective_strength = strength * adaptive_strength
+        if effective_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        corrected = apply_mkl(source, src_product, ref_product)
+        final = source + (corrected - source) * effective_strength
+
+        if mask_bool is not None:
+            for c in range(3):
+                final[:,:,c] = np.where(mask_bool, final[:,:,c], source[:,:,c])
+
+        return np.clip(final, 0, 1)
+
+    def _clone_mini_wavelet(self, source, reference, mask, strength, ref_mask=None):
+        """mini-nodes Wavelet 模式 + 颜色差异自适应"""
+        # Wavelet 需要相同尺寸
+        if source.shape[:2] != reference.shape[:2]:
+            ref_resized = cv2.resize(reference, (source.shape[1], source.shape[0]))
+        else:
+            ref_resized = reference
+
+        if mask is not None and mask.max() > 0.01:
+            mask_bool = mask > 0.5
+            if mask_bool.sum() < 10:
+                return source
+            src_product = source[mask_bool]
+            ref_product = ref_resized[mask_bool]
+        else:
+            src_product = source.reshape(-1, 3)
+            ref_product = ref_resized.reshape(-1, 3)
+            mask_bool = None
+
+        if len(src_product) < 10 or len(ref_product) < 10:
+            return source
+
+        ab_diff, adaptive_strength = self._calc_color_diff(src_product, ref_product)
+        if adaptive_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        effective_strength = strength * adaptive_strength
+        if effective_strength < 0.01:
+            return np.clip(source, 0, 1)
+
+        corrected = apply_wavelet_easy(source, ref_resized)
+        final = source + (corrected - source) * effective_strength
+
+        if mask_bool is not None:
+            for c in range(3):
+                final[:,:,c] = np.where(mask_bool, final[:,:,c], source[:,:,c])
+
+        return np.clip(final, 0, 1)

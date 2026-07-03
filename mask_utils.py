@@ -3,7 +3,6 @@ import numpy as np
 import cv2
 from PIL import Image
 
-
 class MaskProcessor:
     """蒙版处理工具集"""
 
@@ -93,8 +92,8 @@ class MaskProcessor:
 
         if feather > 0:
             feather_pixels = int(radius * feather)
-            mask = cv2.GaussianBlur((mask*255).astype(np.uint8), 
-                                   (feather_pixels*2+1, feather_pixels*2+1), 0)
+            mask = cv2.GaussianBlur((mask*255).astype(np.uint8),
+                                     (feather_pixels*2+1, feather_pixels*2+1), 0)
             mask = mask.astype(np.float32) / 255.0
 
         return mask
@@ -115,7 +114,7 @@ class MaskProcessor:
         if feather > 0:
             feather_pixels = int(max(height, width) * feather)
             mask = cv2.GaussianBlur((mask*255).astype(np.uint8),
-                                   (feather_pixels*2+1, feather_pixels*2+1), 0)
+                                     (feather_pixels*2+1, feather_pixels*2+1), 0)
             mask = mask.astype(np.float32) / 255.0
 
         return mask

@@ -6,6 +6,9 @@ import comfy.utils
 from .color_match_core import ColorMatchEngine, SubjectDetector, ColorClone
 from .mask_utils import MaskProcessor
 
+# ============================================================
+# 1. Color Match 基础追色节点
+# ============================================================
 
 class ColorMatchNode:
     """颜色匹配节点 - 基础追色功能"""
@@ -16,8 +19,8 @@ class ColorMatchNode:
             "required": {
                 "image": ("IMAGE",),
                 "reference": ("IMAGE",),
-                "method": (["mean_shift", "dominant", "histogram", "lab_transfer", "reinhard", "mkl", "idt", "adaptive"], 
-                          {"default": "mean_shift"}),
+                "method": (["mean_shift", "dominant", "histogram", "lab_transfer", "reinhard", "mkl", "idt", "adaptive"],
+                           {"default": "mean_shift"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "preserve_luminance": ("BOOLEAN", {"default": False}),
             },
@@ -41,27 +44,25 @@ class ColorMatchNode:
             img = image[i]
             ref = reference[min(i, reference.shape[0]-1)]
 
-            # 处理蒙版 - 修复维度问题
             m = None
             if mask is not None:
-                if mask.dim() == 4:  # B,1,H,W -> 取第一个
+                if mask.dim() == 4:
                     m = mask[i] if i < mask.shape[0] else mask[0]
                 elif mask.dim() == 3:
-                    if mask.shape[0] == image.shape[0]:  # B,H,W
+                    if mask.shape[0] == image.shape[0]:
                         m = mask[i]
-                    elif mask.shape[0] == 1:  # 1,H,W
+                    elif mask.shape[0] == 1:
                         m = mask[0]
-                    elif mask.shape[-1] == 1:  # H,W,1
+                    elif mask.shape[-1] == 1:
                         m = mask.squeeze(-1)
                     else:
                         m = mask
-                elif mask.dim() == 2:  # H,W
+                elif mask.dim() == 2:
                     m = mask
 
             result = engine.match(img, ref, m, preserve_luminance)
             results.append(torch.from_numpy(result).float())
 
-            # 记录实际使用的蒙版
             if m is not None:
                 m_np = MaskProcessor.tensor_to_mask(m)
                 if m_np.shape[:2] != (img.shape[0], img.shape[1]):
@@ -76,6 +77,10 @@ class ColorMatchNode:
         return (result_tensor, mask_tensor)
 
 
+# ============================================================
+# 2. 自动主体检测蒙版节点
+# ============================================================
+
 class SubjectAutoMaskNode:
     """自动主体检测蒙版节点"""
 
@@ -84,8 +89,8 @@ class SubjectAutoMaskNode:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "method": (["auto", "saliency", "face", "color_cluster", "edge"], 
-                          {"default": "auto"}),
+                "method": (["auto", "saliency", "face", "color_cluster", "edge"],
+                           {"default": "auto"}),
                 "expand_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.01}),
                 "invert": ("BOOLEAN", {"default": False}),
             }
@@ -121,8 +126,29 @@ class SubjectAutoMaskNode:
         return (mask_tensor, preview_tensor)
 
 
+# ============================================================
+# 3. Color Clone 高级颜色克隆节点（核心 - 融合 mini-nodes）
+# ============================================================
+
 class ColorCloneNode:
-    """高级颜色克隆节点 - 模仿原图颜色风格"""
+    """
+    高级颜色克隆节点 - 融合 mini-nodes 算法
+
+    模式说明：
+    - color_adapter: 智能自适应LAB调色（推荐）
+    - product: 产品专用RGB直方图匹配
+    - smart: K-Means智能映射
+    - rgb_match: KNN逐像素匹配
+    - color_only: 仅色调+饱和度
+    - full: 全图风格迁移
+    - tone: 色调迁移
+    - mood: 氛围迁移
+    - palette: 调色板映射
+    - mini_linear: Linear独立缩放（来自mini-nodes）
+    - mini_mean: Mean均值平移（来自mini-nodes）
+    - mini_mkl: MKL协方差映射（来自mini-nodes）
+    - mini_wavelet: Wavelet低频校色（来自mini-nodes）
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -130,7 +156,11 @@ class ColorCloneNode:
             "required": {
                 "image": ("IMAGE",),
                 "reference": ("IMAGE",),
-                "mode": (["color_adapter", "product", "smart", "rgb_match", "color_only", "full", "tone", "mood", "palette"], {"default": "color_adapter"}),
+                "mode": ([
+                    "color_adapter", "product", "smart", "rgb_match",
+                    "color_only", "full", "tone", "mood", "palette",
+                    "mini_linear", "mini_mean", "mini_mkl", "mini_wavelet"
+                ], {"default": "color_adapter"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
@@ -170,8 +200,8 @@ class ColorCloneNode:
                 elif mask.dim() == 2:
                     m = mask
 
-                if m is not None:
-                    m = MaskProcessor.tensor_to_mask(m)
+            if m is not None:
+                m = MaskProcessor.tensor_to_mask(m)
 
             # 处理参考图蒙版
             ref_m = None
@@ -190,14 +220,18 @@ class ColorCloneNode:
                 elif reference_mask.dim() == 2:
                     ref_m = reference_mask
 
-                if ref_m is not None:
-                    ref_m = MaskProcessor.tensor_to_mask(ref_m)
+            if ref_m is not None:
+                ref_m = MaskProcessor.tensor_to_mask(ref_m)
 
             result = cloner.clone(img, ref, mode, m, ref_mask=ref_m, color_strength=strength)
             results.append(torch.from_numpy(result).float())
 
         return (torch.stack(results),)
 
+
+# ============================================================
+# 4. 区域调色节点
+# ============================================================
 
 class RegionalColorMatchNode:
     """区域调色节点 - 支持多区域分别调色"""
@@ -209,8 +243,8 @@ class RegionalColorMatchNode:
                 "image": ("IMAGE",),
                 "region_mask": ("MASK",),
                 "reference": ("IMAGE",),
-                "method": (["mean_shift", "histogram", "lab_transfer", "reinhard", "mkl", "adaptive"], 
-                          {"default": "mean_shift"}),
+                "method": (["mean_shift", "histogram", "lab_transfer", "reinhard", "mkl", "adaptive"],
+                           {"default": "mean_shift"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "feather": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
             },
@@ -226,7 +260,7 @@ class RegionalColorMatchNode:
     CATEGORY = "🎨 ColorMatch Pro"
 
     def regional_match(self, image, region_mask, reference, method, strength, feather,
-                      background_reference=None, bg_strength=0.0):
+                       background_reference=None, bg_strength=0.0):
         engine = ColorMatchEngine(method=method, strength=strength)
         processor = MaskProcessor()
 
@@ -237,21 +271,17 @@ class RegionalColorMatchNode:
             img = image[i]
             ref = reference[min(i, reference.shape[0]-1)]
 
-            # 处理蒙版
             mask = region_mask[min(i, region_mask.shape[0]-1)] if region_mask.dim() > 2 else region_mask
             mask_np = processor.tensor_to_mask(mask)
 
-            # 确保蒙版尺寸匹配
             if mask_np.shape[:2] != (img.shape[0], img.shape[1]):
                 mask_np = cv2.resize(mask_np, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-            # 可选羽化
             if feather > 0:
                 mask_np = processor.feather_mask(mask_np, feather)
 
             result = engine.match(img, ref, mask_np, preserve_luminance=False)
 
-            # 背景处理（可选）
             if background_reference is not None and bg_strength > 0:
                 bg_ref = background_reference[min(i, background_reference.shape[0]-1)]
                 bg_mask = 1.0 - mask_np
@@ -267,6 +297,10 @@ class RegionalColorMatchNode:
         return (result_tensor, mask_tensor)
 
 
+# ============================================================
+# 5. 蒙版工具节点
+# ============================================================
+
 class MaskToolNode:
     """蒙版工具节点 - 蒙版处理操作"""
 
@@ -275,14 +309,14 @@ class MaskToolNode:
         return {
             "required": {
                 "mask": ("MASK",),
-                "operation": (["feather", "expand", "shrink", "smooth", "invert", 
-                              "threshold", "blur"], {"default": "feather"}),
+                "operation": (["feather", "expand", "shrink", "smooth", "invert",
+                               "threshold", "blur"], {"default": "feather"}),
                 "amount": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 100.0, "step": 0.5}),
             },
             "optional": {
                 "mask_b": ("MASK",),
-                "combine_op": (["union", "intersection", "subtract", "multiply"], 
-                              {"default": "union"}),
+                "combine_op": (["union", "intersection", "subtract", "multiply"],
+                               {"default": "union"}),
             }
         }
 
@@ -320,7 +354,7 @@ class MaskToolNode:
         elif operation == "threshold":
             result = (mask_np > amount/100.0).astype(np.float32)
         elif operation == "blur":
-            result = cv2.GaussianBlur((mask_np*255).astype(np.uint8), 
+            result = cv2.GaussianBlur((mask_np*255).astype(np.uint8),
                                      (int(amount)*2+1, int(amount)*2+1), 0).astype(np.float32)/255
 
         result_tensor = processor.mask_to_tensor(result)
@@ -332,6 +366,10 @@ class MaskToolNode:
         return (result_tensor,)
 
 
+# ============================================================
+# 6. 色差修正节点
+# ============================================================
+
 class ColorCorrectionNode:
     """色差修正节点 - 自动修正AI出图色差"""
 
@@ -340,7 +378,7 @@ class ColorCorrectionNode:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "target_color": (["auto", "neutral", "warm", "cool", "vintage", "cinematic"], 
+                "target_color": (["auto", "neutral", "warm", "cool", "vintage", "cinematic"],
                                 {"default": "auto"}),
                 "correction_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "white_balance": ("BOOLEAN", {"default": True}),
@@ -356,8 +394,8 @@ class ColorCorrectionNode:
     FUNCTION = "correct_color"
     CATEGORY = "🎨 ColorMatch Pro"
 
-    def correct_color(self, image, target_color, correction_strength, white_balance, 
-                     contrast_adjust, mask=None):
+    def correct_color(self, image, target_color, correction_strength, white_balance,
+                      contrast_adjust, mask=None):
         results = []
 
         for i in range(image.shape[0]):
@@ -410,6 +448,10 @@ class ColorCorrectionNode:
         return np.clip((img - mean) * (1 + amount) + mean, 0, 1)
 
 
+# ============================================================
+# 7. 批量颜色匹配节点
+# ============================================================
+
 class BatchColorMatchNode:
     """批量颜色匹配 - 支持多参考图批量处理"""
 
@@ -419,8 +461,8 @@ class BatchColorMatchNode:
             "required": {
                 "images": ("IMAGE",),
                 "references": ("IMAGE",),
-                "method": (["mean_shift", "histogram", "lab_transfer", "reinhard", "mkl", "adaptive"], 
-                          {"default": "mean_shift"}),
+                "method": (["mean_shift", "histogram", "lab_transfer", "reinhard", "mkl", "adaptive"],
+                           {"default": "mean_shift"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
@@ -461,6 +503,138 @@ class BatchColorMatchNode:
         return (torch.stack(results),)
 
 
+# ============================================================
+# 8. 智能颜色克隆节点（简化版 - 自动检测差异并选择模式）
+# ============================================================
+
+class SmartColorCloneNode:
+    """
+    智能颜色克隆节点 - 一键智能调色
+
+    自动检测颜色差异：
+    - 差异 < 3: 几乎不改（保留原图）
+    - 差异 3~8: 轻微校正
+    - 差异 8~15: 适度校正
+    - 差异 > 15: 全力校正
+
+    自动排除参考图白色背景干扰
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "auto_skip": ("BOOLEAN", {"default": True, "tooltip": "颜色接近时自动跳过调色"}),
+            },
+            "optional": {
+                "mask": ("MASK",),
+                "reference_mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "FLOAT", "STRING")
+    RETURN_NAMES = ("cloned_image", "color_diff", "debug_info")
+    FUNCTION = "smart_clone"
+    CATEGORY = "🎨 ColorMatch Pro"
+
+    def smart_clone(self, image, reference, strength, auto_skip, mask=None, reference_mask=None):
+        cloner = ColorClone()
+
+        results = []
+        diffs = []
+        infos = []
+
+        for i in range(image.shape[0]):
+            img = image[i]
+            ref = reference[min(i, reference.shape[0]-1)]
+
+            # 处理蒙版
+            m = None
+            if mask is not None:
+                if mask.dim() == 4:
+                    m = mask[i] if i < mask.shape[0] else mask[0]
+                elif mask.dim() == 3:
+                    if mask.shape[0] == image.shape[0]:
+                        m = mask[i]
+                    elif mask.shape[0] == 1:
+                        m = mask[0]
+                    elif mask.shape[-1] == 1:
+                        m = mask.squeeze(-1)
+                    else:
+                        m = mask
+                elif mask.dim() == 2:
+                    m = mask
+
+            if m is not None:
+                m = MaskProcessor.tensor_to_mask(m)
+
+            ref_m = None
+            if reference_mask is not None:
+                if reference_mask.dim() == 4:
+                    ref_m = reference_mask[min(i, reference_mask.shape[0]-1)]
+                elif reference_mask.dim() == 3:
+                    if reference_mask.shape[0] == reference.shape[0]:
+                        ref_m = reference_mask[min(i, reference_mask.shape[0]-1)]
+                    elif reference_mask.shape[0] == 1:
+                        ref_m = reference_mask[0]
+                    elif reference_mask.shape[-1] == 1:
+                        ref_m = reference_mask.squeeze(-1)
+                    else:
+                        ref_m = reference_mask
+                elif reference_mask.dim() == 2:
+                    ref_m = reference_mask
+
+            if ref_m is not None:
+                ref_m = MaskProcessor.tensor_to_mask(ref_m)
+
+            # 计算颜色差异
+            source_np = cloner._to_numpy(img)
+            ref_np = cloner._to_numpy(ref)
+            if source_np.shape[:2] != ref_np.shape[:2]:
+                ref_np = cv2.resize(ref_np, (source_np.shape[1], source_np.shape[0]))
+
+            ref_product = cloner._extract_product_color(ref_np, ref_m, white_thresh=0.88)
+
+            if m is not None and m.max() > 0.01:
+                mask_bool = m > 0.5
+                if mask_bool.sum() > 10:
+                    src_product = source_np[mask_bool]
+                else:
+                    src_product = source_np.reshape(-1, 3)
+            else:
+                src_product = source_np.reshape(-1, 3)
+
+            ab_diff, adaptive_strength = cloner._calc_color_diff(src_product, ref_product)
+            diffs.append(float(ab_diff))
+
+            # 根据差异选择模式
+            if ab_diff < 3 and auto_skip:
+                mode = "color_adapter"  # 会内部跳过
+                info = f"差异{ab_diff:.1f}: 颜色接近，已跳过"
+            elif ab_diff < 8:
+                mode = "mini_mean"
+                info = f"差异{ab_diff:.1f}: 轻微校正 (Mean)"
+            elif ab_diff < 15:
+                mode = "color_adapter"
+                info = f"差异{ab_diff:.1f}: 适度校正 (ColorAdapter)"
+            else:
+                mode = "product"
+                info = f"差异{ab_diff:.1f}: 全力校正 (Product)"
+
+            result = cloner.clone(img, ref, mode, m, ref_mask=ref_m, color_strength=strength)
+            results.append(torch.from_numpy(result).float())
+            infos.append(info)
+
+        return (torch.stack(results), max(diffs), " | ".join(infos))
+
+
+# ============================================================
+# 节点注册
+# ============================================================
+
 NODE_CLASS_MAPPINGS = {
     "ColorMatchPro": ColorMatchNode,
     "SubjectAutoMask": SubjectAutoMaskNode,
@@ -469,6 +643,7 @@ NODE_CLASS_MAPPINGS = {
     "MaskToolPro": MaskToolNode,
     "ColorCorrectionPro": ColorCorrectionNode,
     "BatchColorMatch": BatchColorMatchNode,
+    "SmartColorClone": SmartColorCloneNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -479,4 +654,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaskToolPro": "🔧 Mask Tool (蒙版工具)",
     "ColorCorrectionPro": "⚡ Color Correction (色差修正)",
     "BatchColorMatch": "📦 Batch Color Match (批量追色)",
+    "SmartColorClone": "🧠 Smart Color Clone (智能一键追色)",
 }
